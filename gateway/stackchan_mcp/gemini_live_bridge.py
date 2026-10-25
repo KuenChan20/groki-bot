@@ -375,6 +375,10 @@ def build_live_config(
         )
     if response_modality == "TEXT":
         config.output_audio_transcription = types.AudioTranscriptionConfig()
+        # Native audio (3.x remaps TEXT onto AUDIO) can subtitle the user.
+        # 2.x stays on a real TEXT modality and must not gain this field.
+        if live_modality == "AUDIO":
+            config.input_audio_transcription = types.AudioTranscriptionConfig()
     return config
 
 
@@ -425,6 +429,7 @@ class GeminiLiveBridge(VoiceToolExecutor):
         system_instruction: str | None = None,
         on_audio: AudioCallback | None = None,
         on_text: TextCallback | None = None,
+        on_user_transcript: TextCallback | None = None,
         on_turn_complete: TurnCompleteCallback | None = None,
         on_interrupt: TurnCompleteCallback | None = None,
         on_end_conversation: TurnCompleteCallback | None = None,
@@ -455,6 +460,7 @@ class GeminiLiveBridge(VoiceToolExecutor):
         self._system_instruction = system_instruction or build_system_instruction()
         self._on_audio = on_audio
         self._on_text = on_text
+        self._on_user_transcript = on_user_transcript
         self._on_turn_complete = on_turn_complete
         self._on_interrupt = on_interrupt
         self._output = VoiceOutputQueue()
@@ -471,6 +477,7 @@ class GeminiLiveBridge(VoiceToolExecutor):
         # Buffer text fragments until the model marks the turn complete so
         # we send one TTS request per utterance instead of one per token.
         self._text_buf: list[str] = []
+        self._input_transcript_parts: list[str] = []
         # Gemini Live sessions cap at ~15 min. When True, _run rebuilds the
         # session whenever the receive loop exits (either ``GoAway`` from
         # Gemini or any transport error) so callers stay connected end-to-end.
@@ -846,6 +853,8 @@ class GeminiLiveBridge(VoiceToolExecutor):
         if self._has_model_output(server_content):
             self._cancel_silence_timeout()
 
+        await self._emit_user_transcript(server_content)
+
         # Forward any audio chunks if the caller wired up a sink. We do not
         # play them automatically; the StackChan TTS pipeline is the caller's
         # responsibility because it needs to wrap PCM in the Opus protocol.
@@ -900,9 +909,36 @@ class GeminiLiveBridge(VoiceToolExecutor):
         """Discard old output before resetting the device sink for a new turn."""
         self._cancel_silence_timeout()
         self._text_buf.clear()
+        self._input_transcript_parts.clear()
         await self._output.cancel()
         if self._on_interrupt is not None:
             await self._on_interrupt()
+
+    async def _emit_user_transcript(self, server_content: Any) -> None:
+        """Forward a finished user transcript. Interim hypotheses stay off-device.
+
+        ``input_transcription`` is the finalized line. Chunks with
+        ``finished is False`` are held and joined; a missing flag means this
+        event is already the completed segment.
+        """
+        transcription = getattr(server_content, "input_transcription", None)
+        if transcription is None:
+            return
+        text = getattr(transcription, "text", None)
+        if isinstance(text, str) and text:
+            self._input_transcript_parts.append(text)
+        if getattr(transcription, "finished", None) is False:
+            return
+        if not self._input_transcript_parts:
+            return
+        joined = "".join(self._input_transcript_parts).strip()
+        self._input_transcript_parts.clear()
+        if not joined or self._on_user_transcript is None:
+            return
+        try:
+            await self._on_user_transcript(joined)
+        except Exception:
+            logger.exception("on_user_transcript callback failed")
 
     @staticmethod
     def _has_model_output(server_content: Any) -> bool:

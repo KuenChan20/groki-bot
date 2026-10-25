@@ -1505,12 +1505,12 @@ async def test_speak_text_returns_error_when_disconnected(monkeypatch, info):
 
 @pytest.mark.asyncio
 async def test_bridge_factory_receives_voice_callbacks(monkeypatch, info):
-    """AUDIO path: on_audio drives Opus directly, transcript only feeds logs.
+    """AUDIO path: on_audio drives Opus directly, transcript feeds the balloon.
 
     We still request response_modality="TEXT" so the bridge enables
     output_audio_transcription, but the wiring is reversed compared to the
     pre-fix-voice-latency setup: native PCM goes to _handle_gemini_audio,
-    text just goes to the logger (not edge-tts).
+    text goes to the logger and the device balloon (not edge-tts).
     """
     proxy, _, sent = _make_proxy(monkeypatch=monkeypatch)
 
@@ -1529,6 +1529,7 @@ async def test_bridge_factory_receives_voice_callbacks(monkeypatch, info):
     # function on the same instance.
     assert captured.get("on_audio") == proxy._handle_gemini_audio
     assert captured.get("on_text") == proxy._log_gemini_transcript
+    assert captured.get("on_user_transcript") == proxy._forward_user_transcript
     assert captured.get("on_turn_complete") == proxy.end_tts
     assert captured.get("response_modality") == "TEXT"
     assert captured.get("debug_status") is proxy._status
@@ -1577,6 +1578,38 @@ async def test_drain_restores_cushion_after_source_stall(monkeypatch, info):
         f"cushion not restored after the stall: last frame {cushions[-1]:.0f} ms, "
         f"all {[f'{c:.0f}' for c in cushions]}"
     )
+
+
+# --- Native transcript balloons ------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_native_transcript_appends_balloon_and_records(caplog):
+    """Assistant clauses update the balloon. Opus is not involved."""
+    from stackchan_mcp.debug_status import DebugStatus
+
+    status = DebugStatus()
+    proxy, _, sent = _make_proxy(debug_status=status)
+
+    async def send(msg):
+        sent.append(msg)
+
+    proxy._send_to_device = send
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.gemini_voice_proxy")
+
+    await proxy._forward_user_transcript("  ")
+    await proxy._forward_user_transcript("在吗")
+    await proxy._log_gemini_transcript("你好")
+    await proxy._log_gemini_transcript("呀")
+
+    assert [json.loads(message) for message in sent] == [
+        {"type": "stt", "text": "在吗"},
+        {"type": "tts", "state": "sentence_start", "text": "你好"},
+        {"type": "tts", "state": "sentence_start", "text": "呀"},
+    ]
+    assert [row["text"] for row in status.recent_transcripts] == ["在吗", "你好", "呀"]
+    assert "gemini transcript: 你好" in caplog.text
+    assert "在吗" not in caplog.text
 
 
 # --- Session keepalive wiring --------------------------------------------------

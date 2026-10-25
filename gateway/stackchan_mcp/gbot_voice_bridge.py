@@ -117,6 +117,9 @@ class GbotVoiceBridge:
         api_key=None,
         response_modality=None,
         on_text=None,
+        on_user_transcript=None,
+        on_assistant_delta=None,
+        on_assistant_turn=None,
         on_end_conversation=None,
         usb_transport=None,
         on_head_command=None,
@@ -142,6 +145,9 @@ class GbotVoiceBridge:
         self.call_id = str(uuid.uuid4())
         self._on_transcript = on_transcript
         self._on_text = on_text
+        self._on_user_transcript = on_user_transcript
+        self._on_assistant_delta = on_assistant_delta
+        self._on_assistant_turn = on_assistant_turn
         self._on_end_conversation = on_end_conversation
         self._executor = tool_executor
         self._executor_factory = tool_executor_factory
@@ -722,6 +728,14 @@ class GbotVoiceBridge:
         )
         await self._request_response()
 
+    def _assistant_transcript_dropped(self, event) -> bool:
+        """Ignore captions for audio that will not be played."""
+        response_id = event.get("response_id") or self._active_response
+        if self._drop_until_response or response_id in self._suppressed:
+            return True
+        explicit = event.get("response_id")
+        return bool(explicit) and explicit != self._active_response
+
     async def interrupt(self):
         self._cancel_idle()
         self._pending_response = False
@@ -762,6 +776,8 @@ class GbotVoiceBridge:
             logger.info("Grok voice response state=created trigger=%s", trigger)
             self.response_started_at[self._active_response] = time.monotonic()
             self._drop_until_response = False
+            if self._on_assistant_turn is not None:
+                await self._on_assistant_turn()
         elif kind == "input_audio_buffer.speech_started":
             self.metrics["speech_starts"] += 1
             self._user_epoch += 1
@@ -797,16 +813,44 @@ class GbotVoiceBridge:
             self._output.submit(lambda: self._on_audio(audio))
             await asyncio.sleep(0)
         elif kind in {
+            "response.audio_transcript.delta",
+            "response.output_audio_transcript.delta",
+        }:
+            if self._assistant_transcript_dropped(event):
+                return
+            if self._on_transcript:
+                await self._on_transcript(event)
+            delta = event.get("delta") or ""
+            if self._on_assistant_delta and isinstance(delta, str) and delta.strip():
+                await self._on_assistant_delta(delta)
+        elif kind in {
             "response.audio_transcript.done",
             "response.output_audio_transcript.done",
             "conversation.item.input_audio_transcription.completed",
         }:
+            if (
+                kind != "conversation.item.input_audio_transcription.completed"
+                and self._assistant_transcript_dropped(event)
+            ):
+                return
             if self._on_transcript:
                 await self._on_transcript(event)
             text = event.get("transcript", "")
+            if not isinstance(text, str):
+                text = ""
             if kind == "conversation.item.input_audio_transcription.completed":
                 if self._executor:
                     await self._executor.observe_user_input(text, finished=True)
+                # xAI reuses this event for in-progress partials. The device
+                # balloon replaces on stt, so only the finished line is sent.
+                status = event.get("status")
+                partial = isinstance(status, str) and status in {
+                    "in_progress",
+                    "incomplete",
+                    "failed",
+                }
+                if self._on_user_transcript and not partial:
+                    await self._on_user_transcript(text)
             elif self._on_text and text:
                 await self._on_text(text)
         elif kind == "response.done":

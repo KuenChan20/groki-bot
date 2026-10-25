@@ -1459,6 +1459,10 @@ def test_build_live_config_text_mode_remaps_for_gemini_3_models(model, expected)
     cfg = build_live_config(response_modality="TEXT", model=model)
     assert _modality_values(cfg.response_modalities) == expected
     assert cfg.output_audio_transcription is not None
+    if expected == ["AUDIO"]:
+        assert cfg.input_audio_transcription is not None
+    else:
+        assert getattr(cfg, "input_audio_transcription", None) is None
 
 
 @pytest.mark.asyncio
@@ -1656,6 +1660,47 @@ async def test_handle_output_transcription_flushes_when_finished():
     await bridge._handle_message(Resp("我抬头", True))
 
     assert captured == ["好的，我抬头"]
+
+
+@pytest.mark.asyncio
+async def test_input_transcription_forwards_only_when_finished():
+    """Final user speech becomes one callback. Unfinished chunks stay buffered."""
+    captured: list[str] = []
+
+    async def on_user_transcript(text: str) -> None:
+        captured.append(text)
+
+    bridge = GeminiLiveBridge(
+        FakeESP32(),
+        api_key="k",
+        on_user_transcript=on_user_transcript,
+    )
+
+    class Transcript:
+        def __init__(self, text: str, finished: bool | None):
+            self.text = text
+            self.finished = finished
+
+    class Content:
+        model_turn = None
+        turn_complete = False
+        output_transcription = None
+
+        def __init__(self, text: str, finished: bool | None):
+            self.input_transcription = Transcript(text, finished)
+
+    class Resp:
+        tool_call = None
+
+        def __init__(self, text: str, finished: bool | None):
+            self.server_content = Content(text, finished)
+
+    await bridge._handle_message(Resp("你", False))
+    assert captured == []
+    await bridge._handle_message(Resp("好", True))
+    assert captured == ["你好"]
+    await bridge._handle_message(Resp("在吗", None))
+    assert captured == ["你好", "在吗"]
 
 
 # --- session lifecycle / reconnect -------------------------------------------

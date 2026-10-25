@@ -27,7 +27,18 @@ class GbotVoiceProxy(GeminiVoiceProxy):
     def _voice_tts_mode(self):
         return "native"
 
+    def _log_transcript_text(self) -> bool:
+        return False
+
+    def _on_text_transcript_is_cumulative(self) -> bool:
+        return True
+
+    def _reset_balloon_when_turn_ends(self) -> bool:
+        return False
+
     def _make_bridge(self, esp32, **kwargs):
+        kwargs.setdefault("on_assistant_delta", self._show_assistant_balloon)
+        kwargs.setdefault("on_assistant_turn", self._reset_assistant_balloon)
         return (self.bridge_factory or GbotVoiceBridge)(
             esp32=esp32,
             tool_executor=self.voice_tool_executor,

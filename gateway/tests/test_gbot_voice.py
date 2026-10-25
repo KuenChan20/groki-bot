@@ -4,6 +4,8 @@
 
 import asyncio
 import base64
+import json
+import logging
 import struct
 from unittest.mock import AsyncMock
 
@@ -274,3 +276,173 @@ async def test_native_registration_failure_keeps_voice_start_running(monkeypatch
     assert b.running and not b._native.ready
     await b.stop()
     assert b._native._task.done()
+
+
+def _balloon_proxy():
+    from stackchan_mcp.debug_status import DebugStatus
+
+    status = DebugStatus()
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    proxy = GbotVoiceProxy(debug_status=status, codec_factory=lambda: object())
+    proxy._send_to_device = send
+    voice = GbotVoiceBridge(
+        on_audio=AsyncMock(),
+        on_turn_complete=AsyncMock(),
+        on_interrupt=AsyncMock(),
+        on_session_dead=AsyncMock(),
+        on_text=proxy._log_gemini_transcript,
+        on_user_transcript=proxy._forward_user_transcript,
+        on_assistant_delta=proxy._show_assistant_balloon,
+        on_assistant_turn=proxy._reset_assistant_balloon,
+    )
+    voice._send = AsyncMock()
+    return proxy, voice, sent, status
+
+
+def _control_messages(sent):
+    return [json.loads(message) for message in sent if isinstance(message, str)]
+
+
+@pytest.mark.asyncio
+async def test_gbot_transcripts_fill_balloon_without_logging_text(caplog):
+    proxy, voice, sent, status = _balloon_proxy()
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.gemini_voice_proxy")
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.gbot_voice_bridge")
+
+    await voice._handle_event(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "  ",
+            "status": "completed",
+        }
+    )
+    await voice._handle_event(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "你好",
+            "status": "in_progress",
+        }
+    )
+    await voice._handle_event(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "你好",
+            "status": "completed",
+        }
+    )
+    await voice._handle_event({"type": "response.created", "response": {"id": "r1"}})
+    await voice._handle_event(
+        {
+            "type": "response.output_audio_transcript.delta",
+            "response_id": "r1",
+            "delta": "我",
+        }
+    )
+    await voice._handle_event(
+        {
+            "type": "response.audio_transcript.delta",
+            "response_id": "r1",
+            "delta": "在",
+        }
+    )
+    await voice._handle_event(
+        {
+            "type": "response.output_audio_transcript.done",
+            "response_id": "r1",
+            "transcript": "我在",
+        }
+    )
+
+    assert _control_messages(sent) == [
+        {"type": "stt", "text": "你好"},
+        {"type": "tts", "state": "sentence_start", "text": "我"},
+        {"type": "tts", "state": "sentence_start", "text": "在"},
+    ]
+    assert [row["text"] for row in status.recent_transcripts] == ["你好", "我在"]
+    assert "你好" not in caplog.text
+    assert "我在" not in caplog.text
+    assert proxy._assistant_balloon_text == "我在"
+
+
+@pytest.mark.asyncio
+async def test_gbot_done_transcript_sends_balloon_when_no_deltas():
+    _proxy, voice, sent, status = _balloon_proxy()
+    await voice._handle_event({"type": "response.created", "response": {"id": "r1"}})
+    await voice._handle_event(
+        {
+            "type": "response.audio_transcript.done",
+            "response_id": "r1",
+            "transcript": "我在呢",
+        }
+    )
+    assert _control_messages(sent) == [
+        {"type": "tts", "state": "sentence_start", "text": "我在呢"},
+    ]
+    assert [row["text"] for row in status.recent_transcripts] == ["我在呢"]
+
+
+@pytest.mark.asyncio
+async def test_gbot_drops_captions_for_discarded_audio():
+    _proxy, voice, sent, _status = _balloon_proxy()
+    await voice._handle_event({"type": "response.created", "response": {"id": "old"}})
+    await voice.interrupt()
+    await voice._handle_event(
+        {
+            "type": "response.output_audio_transcript.delta",
+            "response_id": "old",
+            "delta": "别说了",
+        }
+    )
+    await voice._handle_event(
+        {
+            "type": "response.output_audio_transcript.done",
+            "response_id": "old",
+            "transcript": "别说了",
+        }
+    )
+    await voice._handle_event({"type": "response.created", "response": {"id": "next"}})
+    await voice._handle_event(
+        {
+            "type": "response.output_audio_transcript.delta",
+            "response_id": "old",
+            "delta": "还是旧的",
+        }
+    )
+    await voice._handle_event(
+        {
+            "type": "response.output_audio_transcript.delta",
+            "response_id": "next",
+            "delta": "新的",
+        }
+    )
+    assert _control_messages(sent) == [
+        {"type": "tts", "state": "sentence_start", "text": "新的"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_gbot_start_wires_balloon_callbacks(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    captured = {}
+
+    def factory(**kwargs):
+        captured.update(kwargs)
+        fake = bridge()
+        fake.start = AsyncMock()
+        fake.wait_connected = AsyncMock(return_value=True)
+        fake.running = True
+        fake._connected_event.set()
+        return fake
+
+    proxy = GbotVoiceProxy(bridge_factory=factory, codec_factory=lambda: object())
+    assert await proxy.start(type("Info", (), {"device_id": "test"})(), {}, AsyncMock())
+    assert captured["on_text"] == proxy._log_gemini_transcript
+    assert captured["on_user_transcript"] == proxy._forward_user_transcript
+    assert captured["on_assistant_delta"] == proxy._show_assistant_balloon
+    assert captured["on_assistant_turn"] == proxy._reset_assistant_balloon
+    await proxy.stop()

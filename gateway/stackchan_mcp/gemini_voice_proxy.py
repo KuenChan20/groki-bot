@@ -196,6 +196,9 @@ class GeminiVoiceProxy:
     _turn_rx_bytes: int = 0
     _turn_rx_stalls: int = 0
     _turn_rx_max_gap: float = 0.0
+    # Text already pushed via sentence_start. Firmware appends each one, so a
+    # later cumulative transcript must not be sent again in full.
+    _assistant_balloon_text: str = ""
 
     @property
     def _status(self) -> DebugStatus:
@@ -322,9 +325,10 @@ class GeminiVoiceProxy:
         # to the device. Bypasses edge-tts entirely (saves ~2-3 s of first-
         # phrase latency). We still ask the bridge for "TEXT" — internally
         # that means AUDIO + output_audio_transcription, which gives us
-        # transcripts for logging at no latency cost. The transcription is
-        # routed to _log_gemini_transcript (not _handle_gemini_text, which
-        # would re-trigger edge-tts).
+        # transcripts at no latency cost. The transcription is routed to
+        # _log_gemini_transcript (device balloon + /debug/status, not
+        # _handle_gemini_text, which would re-trigger edge-tts). User speech
+        # transcripts take the separate on_user_transcript path.
         #
         # edge-tts stays available as self._edge_tts for the MCP "say" tool
         # and as a deliberate fallback path.
@@ -360,6 +364,7 @@ class GeminiVoiceProxy:
             response_modality="TEXT",
             on_audio=self._handle_gemini_audio,
             on_text=on_text,
+            on_user_transcript=self._forward_user_transcript,
             on_turn_complete=self.end_tts,
             on_interrupt=self._abort_in_flight_tts,
             on_end_conversation=self._handle_bridge_end_conversation,
@@ -791,19 +796,107 @@ class GeminiVoiceProxy:
         self._tts_tasks.add(task)
         task.add_done_callback(self._on_tts_task_done)
 
-    async def _log_gemini_transcript(self, text: str) -> None:
-        """Default on_text in AUDIO mode: log the transcript, do not synthesize.
+    def _log_transcript_text(self) -> bool:
+        """Gemini logs assistant text at INFO. Gbot keeps the words out of logs."""
+        return True
 
-        Gemini's ``output_audio_transcription`` gives us a free running
-        transcript of what the model just said in audio. Useful for debugging
-        and observability — without it, a Gemini-side stutter or wrong word
-        looks like a mysterious noise from the speaker. We never feed this
-        text to a TTS engine in AUDIO mode; the speaker is already saying
-        the words via native PCM.
+    def _on_text_transcript_is_cumulative(self) -> bool:
+        """Gbot's on_text is the full done transcript. Gemini segments are pieces."""
+        return False
+
+    def _reset_balloon_when_turn_ends(self) -> bool:
+        """Gbot resets on the next response instead, so a late done event can dedupe."""
+        return True
+
+    def _finish_assistant_balloon_turn(self) -> None:
+        if self._reset_balloon_when_turn_ends():
+            self._assistant_balloon_text = ""
+
+    async def _reset_assistant_balloon(self) -> None:
+        self._assistant_balloon_text = ""
+
+    async def _send_device_control(self, payload: dict[str, Any]) -> None:
+        """Send one XiaoZhi JSON control message. Failures stay off the audio path."""
+        if self._stopped or self._send_to_device is None:
+            return
+        try:
+            message = json.dumps(payload, ensure_ascii=False)
+            async with self._send_lock:
+                await self._send_to_device(message)
+        except Exception as exc:
+            logger.warning("device balloon send failed: %s", exc)
+
+    async def _forward_user_transcript(self, text: str) -> None:
+        """Show a completed user transcript in the device balloon.
+
+        Firmware ``stt`` replaces the balloon. Empty text is skipped so a
+        blank event cannot wipe the line. The words are stored for
+        ``/debug/status`` and are not written to the INFO log.
         """
-        if text:
+        if not isinstance(text, str):
+            return
+        cleaned = text.strip()
+        if not cleaned:
+            return
+        self._status.record_transcript(cleaned)
+        await self._send_device_control({"type": "stt", "text": cleaned})
+
+    def _assistant_balloon_fragment(self, text: str, *, cumulative: bool) -> str:
+        """Return the sentence_start piece that is not already on screen.
+
+        Firmware appends every non-empty ``sentence_start``. Deltas are new
+        pieces. A done event is the full utterance, so only the unseen tail
+        is sent — or nothing, once the deltas have already spelled it out.
+        """
+        if not isinstance(text, str):
+            return ""
+        shown = self._assistant_balloon_text
+        body = text.strip() if cumulative or not shown else text
+        if not body.strip():
+            return ""
+        if cumulative:
+            if not shown:
+                fragment = body
+            elif body.startswith(shown):
+                fragment = body[len(shown) :]
+                if not fragment.strip():
+                    return ""
+            else:
+                return ""
+        else:
+            fragment = body
+        self._assistant_balloon_text += fragment
+        return fragment
+
+    async def _show_assistant_balloon(
+        self, text: str, *, cumulative: bool = False
+    ) -> None:
+        """Push assistant text to the balloon without touching the Opus stream."""
+        fragment = self._assistant_balloon_fragment(text, cumulative=cumulative)
+        if not fragment:
+            return
+        await self._send_device_control(
+            {"type": "tts", "state": "sentence_start", "text": fragment}
+        )
+
+    async def _log_gemini_transcript(self, text: str) -> None:
+        """Default on_text in AUDIO mode: show the transcript, do not synthesize.
+
+        Gemini's ``output_audio_transcription`` is a running transcript of the
+        audio already going to the speaker. Native mode never feeds it to a
+        TTS engine. Segments are appended on the balloon; ``/debug/status``
+        still records each one. Gemini keeps the historical INFO line. Gbot
+        turns that line off.
+        """
+        if not text:
+            return
+        if self._log_transcript_text():
             logger.info("gemini transcript: %s", text)
-            self._status.record_transcript(text)
+        self._status.record_transcript(text)
+        await self._show_assistant_balloon(
+            text,
+            cumulative=self._on_text_transcript_is_cumulative(),
+        )
 
     def _on_tts_task_done(self, task: asyncio.Task[None]) -> None:
         self._tts_tasks.discard(task)
@@ -1263,6 +1356,7 @@ class GeminiVoiceProxy:
 
         if not self._tts_active:
             self._clear_turn_emotion_face()
+            self._finish_assistant_balloon_turn()
             return
 
         # Push codec tail through the drain so it stays in cadence with the
@@ -1298,6 +1392,7 @@ class GeminiVoiceProxy:
             self._signal_speaking_avatar("idle")
             self._signal_speaking_leds(*self._post_tts_led_rgb())
             self._clear_turn_emotion_face()
+        self._finish_assistant_balloon_turn()
 
     async def _abort_in_flight_tts(self) -> None:
         """Drop in-flight TTS and tell the device to leave Speaking state.
@@ -1333,6 +1428,7 @@ class GeminiVoiceProxy:
                 logger.debug("abort tts.stop drop: %s", exc)
             self._signal_speaking_leds(*self._post_tts_led_rgb())
         self._clear_turn_emotion_face()
+        self._finish_assistant_balloon_turn()
 
     def _post_tts_led_rgb(self) -> tuple[int, int, int]:
         if self._reported_dead:
